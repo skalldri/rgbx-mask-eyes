@@ -124,6 +124,20 @@ constexpr size_t kNumExpressions = sizeof(kExpressions) / sizeof(kExpressions[0]
 constexpr size_t kParamColor = 0;
 constexpr size_t kParamGlitchMs = 1;
 constexpr size_t kParamIdleGlitch = 2;
+constexpr size_t kParamJitterPct = 3;
+constexpr size_t kParamDoubleTakePct = 4;
+
+/* Jitter is capped below 100% so a transition can never come out zero-length:
+ * at 100 the low end of the range would be an instant cut, which reads as the
+ * effect having failed rather than as a fast glitch. */
+constexpr uint32_t kMaxJitterPct = 90;
+
+/* A double-take re-glitches IN PLACE on the expression that just landed, so it
+ * reads as the eye snapping, hesitating, and re-settling. Shorter than the
+ * transition it follows — at full length it reads as a second transition
+ * instead of a stutter. */
+constexpr uint32_t kDoubleTakeNumerator = 1;
+constexpr uint32_t kDoubleTakeDenominator = 2;
 
 /* Idle glitch: roughly one micro-tear every few seconds so a held expression
  * never reads as a frozen image. Expressed as a 1-in-N chance per tick at the
@@ -175,26 +189,65 @@ class MaskEyes : public rgbx::Animation {
              * the natural "do it again" and costs nothing to support. */
             previous_ = current_;
             current_ = i;
-            glitchLeftMs_ = glitchTotalMs();
-            glitchSpanMs_ = glitchLeftMs_;
+            startGlitch(glitchBaseMs());
+            /* Rolled at trigger, consumed when this transition ends. Rolling it
+             * at the END instead would re-roll on every frame the transition
+             * happens to finish on, which is the same thing but harder to
+             * reason about. */
+            pendingDoubleTake_ = rollPercent(paramU32(kParamDoubleTakePct));
         }
     }
 
     void advanceGlitch(uint32_t dt_ms) {
         if (glitchLeftMs_ > 0) {
             glitchLeftMs_ = (glitchLeftMs_ > dt_ms) ? (glitchLeftMs_ - dt_ms) : 0;
+            if (glitchLeftMs_ == 0 && pendingDoubleTake_) {
+                pendingDoubleTake_ = false;
+                /* previous_ == current_ means it tears without changing what is
+                 * shown: the stutter lands back on the expression just reached. */
+                previous_ = current_;
+                startGlitch((glitchBaseMs() * kDoubleTakeNumerator) / kDoubleTakeDenominator);
+            }
             return;
         }
         if (paramBool(kParamIdleGlitch) && (rand32() % kIdleGlitchOdds) == 0) {
             /* Same machinery as a transition, but into the SAME expression, so
              * it tears without changing what is shown. */
             previous_ = current_;
-            glitchLeftMs_ = kIdleGlitchMs;
-            glitchSpanMs_ = kIdleGlitchMs;
+            startGlitch(kIdleGlitchMs);
         }
     }
 
-    uint32_t glitchTotalMs() const {
+    /* Every glitch length goes through here, so jitter applies uniformly to
+     * transitions, double-takes and idle tears — a fixed-length idle tear among
+     * jittered transitions would stand out as the one mechanical element. */
+    void startGlitch(uint32_t baseMs) {
+        glitchSpanMs_ = jitter(baseMs);
+        glitchLeftMs_ = glitchSpanMs_;
+    }
+
+    /* Spreads a duration to base +/- (base * jitter%), so the parameter stays
+     * the thing you tune and becomes a CENTRE rather than a constant. */
+    uint32_t jitter(uint32_t baseMs) {
+        uint32_t pct = paramU32(kParamJitterPct);
+        if (pct > kMaxJitterPct) {
+            pct = kMaxJitterPct;
+        }
+        const uint32_t span = (baseMs * pct) / 100u;
+        if (span == 0) {
+            return baseMs;
+        }
+        return baseMs + (rand32() % (2u * span + 1u)) - span;
+    }
+
+    bool rollPercent(uint32_t pct) {
+        if (pct == 0) {
+            return false;
+        }
+        return (rand32() % 100u) < ((pct > 100u) ? 100u : pct);
+    }
+
+    uint32_t glitchBaseMs() const {
         const uint32_t ms = paramU32(kParamGlitchMs);
         /* 0 disables the effect entirely (instant cut); the upper bound keeps a
          * mistyped value from leaving the panel tearing for minutes. */
@@ -262,6 +315,7 @@ class MaskEyes : public rgbx::Animation {
     size_t previous_ = 0;
     uint32_t glitchLeftMs_ = 0;
     uint32_t glitchSpanMs_ = 0;
+    bool pendingDoubleTake_ = false;
     uint32_t rng_ = 0x9E3779B9u;
 };
 
@@ -270,4 +324,6 @@ class MaskEyes : public rgbx::Animation {
 RGBX_ANIMATION(MaskEyes, "Mask Eyes", 40, 12,
                RGBX_PARAM("Color", RGBX_PARAM_COLOR, 0x00FFFFFF),
                RGBX_PARAM("Glitch Ms", RGBX_PARAM_UINT32, 160),
-               RGBX_PARAM("Idle Glitch", RGBX_PARAM_BOOL, 1));
+               RGBX_PARAM("Idle Glitch", RGBX_PARAM_BOOL, 1),
+               RGBX_PARAM("Glitch Jitter", RGBX_PARAM_UINT32, 40),
+               RGBX_PARAM("Double Take", RGBX_PARAM_UINT32, 12));

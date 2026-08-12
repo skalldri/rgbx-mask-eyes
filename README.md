@@ -41,8 +41,21 @@ Both eyes tear together, using one set of per-row effects. They are one display
 on one face — tearing them independently immediately reads as two unrelated
 panels.
 
+**Durations are jittered, not fixed.** `Glitch Ms` is a centre, not a constant:
+every glitch length is spread by ±`Glitch Jitter`%, so transitions, double-takes
+and idle tears all vary. Without this the texture varied but the *rhythm* did
+not — every expression change took exactly the same time to resolve, which over
+a long session reads as mechanical in a way a real failing display would not.
+
+**Double-take.** A transition has a `Double Take`% chance of re-glitching in
+place the moment it lands, so the eye snaps to the new expression, hesitates,
+and re-settles. It runs at half the transition length — at full length it reads
+as a second transition rather than a stutter.
+
 There is also a low-probability idle glitch (~1 tear every few seconds) so a
-held expression never reads as a frozen image.
+held expression never reads as a frozen image. Its interval is a per-tick
+probability rather than a timer, so the gaps are geometrically distributed —
+usually a few seconds, occasionally much shorter or longer.
 
 ## Parameters
 
@@ -51,6 +64,8 @@ held expression never reads as a frozen image.
 | Color | COLOR | white | Full-scale on purpose: the panel renders at ~2% global brightness, so a "dim" colour is invisible |
 | Glitch Ms | UINT32 | 160 | 0 = instant cut, no transition effect. Clamped to 2000 |
 | Idle Glitch | BOOL | on | The occasional tear while holding an expression |
+| Glitch Jitter | UINT32 | 40 | ±% spread on every glitch duration. 0 = fixed. Capped at 90 so a transition can never come out zero-length |
+| Double Take | UINT32 | 12 | % chance a transition stutters and re-lands. 0 = off |
 
 Colour modes (spectrum sweep, random-on-beat, …) work on `Color` for free —
 the host resolves the mode byte before the extension sees it.
@@ -72,8 +87,14 @@ pushing the glyphs down to use it would put their inner edges into the cutout.
 iterated by eye, and a packed bitmask is unreadable to edit. The cost is ~1 KB
 of rodata against a 24 KB llext heap.
 
-**Randomness is a self-contained xorshift32.** The SDK exposes no RNG, and a
-self-seeded one keeps the simulator's output reproducible run to run.
+**Randomness is a self-contained xorshift32.** Not a preference — the SDK's
+supported symbol surface is 34 symbols (string/memory, `printk`, single-precision
+libm, 64-bit division helpers) and contains **no RNG at all**. An extension runs
+in a `K_USER` sandbox and can only resolve symbols the host exports, and the
+`.llext` build gates against that list, so calling into Zephyr for randomness
+fails at build time rather than at runtime. A self-seeded PRNG is also the better
+choice regardless: it keeps the simulator's frame output reproducible run to run,
+which is what makes golden-frame comparison possible.
 
 ## Status
 
