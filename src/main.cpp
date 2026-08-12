@@ -15,6 +15,17 @@
 
 #include <rgbx/rgbx_animation.h>
 
+/* printk is on the SDK's supported symbol surface, but the SDK ships no
+ * declaration for it and a standalone extension builds against no Zephyr
+ * headers — so it has to be declared here.
+ *
+ * The return type is load-bearing: Zephyr's printk and the SDK's wasm shim both
+ * return int. Declaring it void still LINKS (extern "C" mangles to the same
+ * name) and still passes the zero-imports gate, then traps `unreachable` on the
+ * first call, because WebAssembly calls are strictly typed by signature. Clean
+ * build, clean gate, runtime trap. See rgb-sunglasses SDK issue. */
+extern "C" int printk(const char *fmt, ...);
+
 namespace {
 
 /* Glyph canvas, one per eye.
@@ -104,6 +115,37 @@ const char *const kGlyphLt[kGlyphH] = {
     ".........##",  //
 };
 
+/* Tilt uses an ASYMMETRIC pair — one eye wide, one squinting — because that is
+ * what reads as quizzical. Mirroring it also encodes WHICH way the head went,
+ * which a symmetric glyph could not. */
+const char *const kGlyphWide[kGlyphH] = {
+    "...#####...",  //
+    "..##...##..",  //
+    ".##.....##.",  //
+    "##.......##",  //
+    "##.......##",  //
+    "##.......##",  //
+    "##.......##",  //
+    "##.......##",  //
+    ".##.....##.",  //
+    "..##...##..",  //
+    "...#####...",  //
+};
+
+const char *const kGlyphSquint[kGlyphH] = {
+    "...........",  //
+    "...........",  //
+    "...........",  //
+    "...........",  //
+    ".#########.",  //
+    ".#########.",  //
+    ".#########.",  //
+    "...........",  //
+    "...........",  //
+    "...........",  //
+    "...........",  //
+};
+
 struct Expression {
     const char *const *left;
     const char *const *right;
@@ -114,18 +156,98 @@ struct Expression {
  * selection from IMU/audio is the next step and slots in above this table
  * without changing anything below it. */
 const Expression kExpressions[] = {
-    {kGlyphX, kGlyphX},          /* 0 Up    — neutral */
-    {kGlyphCaret, kGlyphCaret},  /* 1 Left  — pleased */
-    {kGlyphBang, kGlyphBang},    /* 2 Right — alert */
-    {kGlyphGt, kGlyphLt},        /* 3 Down  — angry */
+    {kGlyphX, kGlyphX},              /* 0 neutral   — button Up */
+    {kGlyphCaret, kGlyphCaret},      /* 1 pleased   — button Left */
+    {kGlyphBang, kGlyphBang},        /* 2 alert     — button Right */
+    {kGlyphGt, kGlyphLt},            /* 3 angry     — button Down */
+    {kGlyphSquint, kGlyphWide},      /* 4 tilt left  */
+    {kGlyphWide, kGlyphSquint},      /* 5 tilt right */
 };
 constexpr size_t kNumExpressions = sizeof(kExpressions) / sizeof(kExpressions[0]);
+
+enum : size_t {
+    kExprNeutral = 0,
+    kExprPleased = 1,
+    kExprAlert = 2,
+    kExprAngry = 3,
+    kExprTiltLeft = 4,
+    kExprTiltRight = 5,
+};
+
+/* Only the first four are reachable by button; the tilt pair is autonomous-only.
+ * Angry is deliberately the other way round — see the selector. */
+constexpr size_t kNumButtonExpressions = 4;
+
+/* Head tilt (ear toward shoulder) is roll about Z, which shows up on accel.Y:
+ * +X is the crown, +Y the LEFT temple, +Z out the back of the head
+ * (fw/docs/imu-coordinate-frame.md). Tilting left puts world-up partly along
+ * -Y, so negative accel.Y is a left tilt.
+ *
+ * That doc explicitly has NOT bench-verified polarity, so if the tilt glyphs
+ * come out mirrored on a real head, flip this one constant rather than editing
+ * the selector. */
+constexpr float kTiltLeftSign = -1.0f;
 
 constexpr size_t kParamColor = 0;
 constexpr size_t kParamGlitchMs = 1;
 constexpr size_t kParamIdleGlitch = 2;
 constexpr size_t kParamJitterPct = 3;
 constexpr size_t kParamDoubleTakePct = 4;
+constexpr size_t kParamAuto = 5;
+constexpr size_t kParamLively = 6;
+
+/* Two coherent constant sets rather than two builds, so the comparison is a
+ * switch you flip on the phone WHILE WEARING the glasses — instantly, even
+ * mid-song. Reflashing two variants and remembering how the first one felt is
+ * not a comparison anyone can make honestly. */
+struct Profile {
+    uint32_t minDwellMs;   /* floor on how long any expression is held */
+    uint32_t sustainMs;    /* how long a challenger must persist to win */
+    uint32_t alertHoldMs;  /* how long a startle interrupt holds */
+    float tiltEnter;       /* |accel.Y| m/s^2 to enter a tilt */
+    float tiltExit;        /* and to leave it — the gap IS the hysteresis */
+    float bobEnter;        /* smoothed motion to read as "moving" */
+    float bobExit;
+    float startleExcess;   /* rise ABOVE the slow baseline that counts as a startle */
+    float quietCeiling;    /* baseline above this = an already-loud room, no startles */
+    uint32_t startleRefractoryMs;
+};
+
+/* Calm holds a face long enough that moving MEANS something. Lively reacts to
+ * everything and feels alive. Neither is obviously right — that is the whole
+ * reason this is a runtime switch. */
+/* Thresholds are MEASURED, not guessed — read off the sim scenarios with a
+ * temporary trace, after the gravity-seeding fix stopped inflating them:
+ *
+ *   silence      bob 0.00        baseline 0.00
+ *   dance        bob 1.80-2.52   baseline 0.03-0.92
+ *   nod          bob 1.9 (gyro-driven, ~0 before the gyro term)
+ *   metronome    bob 0.00        baseline 0.03-0.92
+ *   pink noise   bob 0.00        baseline 1.23-10.79
+ *
+ * bobEnter therefore has to sit below 1.8 to catch bobbing at all — the first
+ * pass used 2.4, which the `dance` scenario only grazed at its peak, so calm
+ * never reached "pleased". quietCeiling has to sit below ~0.9 or a click track
+ * never raises the baseline out of startle range. */
+constexpr Profile kCalm = {900u, 450u, 900u, 3.2f, 2.0f, 1.6f, 1.0f, 0.8f, 0.5f, 5000u};
+constexpr Profile kLively = {350u, 140u, 550u, 2.0f, 1.2f, 1.1f, 0.7f, 0.5f, 0.5f, 3000u};
+
+/* A manual press pins its expression and suspends autonomous selection, so the
+ * button test path still works with Auto on. */
+constexpr uint32_t kOverrideMs = 6000;
+
+/* Exponential smoothing coefficients, per tick at the nominal ~90 Hz.
+ * Gravity is deliberately far slower than motion: the split between them is
+ * what separates "which way is your head pointing" from "are you moving", and
+ * a gravity estimate that tracks motion collapses the two. */
+constexpr float kGravityAlpha = 0.02f;
+constexpr float kBobAlpha = 0.10f;
+constexpr float kEngageAlpha = 0.06f;
+/* The startle baseline is far slower still — it is "how loud has this room been
+ * lately", which is what makes a bang startling in a quiet room and unremarkable
+ * at a gig. */
+constexpr float kBaselineAlpha = 0.005f;
+constexpr float kGyroWeight = 1.0f;
 
 /* Jitter is capped below 100% so a transition can never come out zero-length:
  * at 100 the low end of the range would be an instant cut, which reads as the
@@ -157,7 +279,10 @@ struct RowFx {
 class MaskEyes : public rgbx::Animation {
    public:
     void tick(uint32_t dt_ms) override {
+        sinceChangeMs_ += dt_ms;
+        updateFeatures(dt_ms);
         readButtons();
+        selectExpression(dt_ms);
         advanceGlitch(dt_ms);
 
         const uint32_t color = paramColor(kParamColor);
@@ -181,7 +306,7 @@ class MaskEyes : public rgbx::Animation {
 
    private:
     void readButtons() {
-        for (size_t i = 0; i < kNumExpressions; i++) {
+        for (size_t i = 0; i < kNumButtonExpressions; i++) {
             if (!buttonWasPressed(i)) {
                 continue;
             }
@@ -195,7 +320,158 @@ class MaskEyes : public rgbx::Animation {
              * happens to finish on, which is the same thing but harder to
              * reason about. */
             pendingDoubleTake_ = rollPercent(paramU32(kParamDoubleTakePct));
+            overrideLeftMs_ = kOverrideMs;
+            sinceChangeMs_ = 0;
         }
+    }
+
+    const Profile &profile() const { return paramBool(kParamLively) ? kLively : kCalm; }
+
+    static float absf(float v) { return v < 0.0f ? -v : v; }
+
+    /* Turns raw inputs into a few stable scalars, each with its own time
+     * constant. Everything downstream reads these rather than rgbx_inputs, so
+     * the selector never sees a single noisy frame. */
+    void updateFeatures(uint32_t dt_ms) {
+        /* Gravity is the LOW-passed accelerometer; motion is what is left. The
+         * accelerometer reads +g on whichever axis points up, so without this
+         * split a lean and a nod are indistinguishable. */
+        if (!gravitySeeded_) {
+            /* Seed from the first sample rather than converging from zero. From
+             * zero the estimate takes ~550 ms to reach real gravity, and until it
+             * does `accel - gravity` is most of a g — measured as bob peaking at
+             * 4.65 in a SILENT, motionless scenario, which is a spurious "you are
+             * moving" every single startup. */
+            gravitySeeded_ = true;
+            gravityX_ = accelX();
+            gravityY_ = accelY();
+            gravityZ_ = accelZ();
+        }
+        gravityX_ += (accelX() - gravityX_) * kGravityAlpha;
+        gravityY_ += (accelY() - gravityY_) * kGravityAlpha;
+        gravityZ_ += (accelZ() - gravityZ_) * kGravityAlpha;
+
+        /* Gyro is included because a nod is a ROTATION: the `nod` scenario drives
+         * gyro alone and measured bob = 0 with an accel-only feature, i.e. the
+         * one motion the issue names as "happy" was invisible. Weighted 1:1 —
+         * rad/s and m/s^2 are not commensurable, so the weight is a tuning
+         * constant chosen to put a brisk nod (~3 rad/s) in the same range as a
+         * head bob, not a unit conversion.
+         *
+         * L1 norm on purpose: this feeds a threshold, so the choice of norm is
+         * arbitrary, and it avoids a libm call entirely. */
+        const float motion = absf(accelX() - gravityX_) + absf(accelY() - gravityY_) +
+                             absf(accelZ() - gravityZ_) +
+                             kGyroWeight * (absf(gyroX()) + absf(gyroY()) + absf(gyroZ()));
+        bob_ += (motion - bob_) * kBobAlpha;
+
+        float energy = 0.0f;
+        for (size_t band = 0; band < numBands(); band++) {
+            energy += bandEnergy(band);
+        }
+        engage_ += (energy - engage_) * kEngageAlpha;
+        baseline_ += (engage_ - baseline_) * kBaselineAlpha;
+
+        /* Beat flags are STICKY for ~3 ticks (fw/sim/PARITY.md), so a level test
+         * counts one beat three times. Rising edge only. */
+        const bool beatNow = isBeat(0);
+        beatEdge_ = beatNow && !beatWas_;
+        beatWas_ = beatNow;
+
+        (void)dt_ms;
+    }
+
+    /* The background mood: what the face settles to when nothing is happening.
+     * Angry has no entry here on purpose — there is no head or audio gesture
+     * that honestly means "angry", and inventing one would make the face lie.
+     * It stays a manual expression. */
+    size_t backgroundMood(const Profile &p) const {
+        const float tilt = accelYTilt();
+        const float enter = (current_ == kExprTiltLeft || current_ == kExprTiltRight) ? p.tiltExit
+                                                                                     : p.tiltEnter;
+        if (absf(tilt) >= enter) {
+            return (tilt * kTiltLeftSign > 0.0f) ? kExprTiltLeft : kExprTiltRight;
+        }
+
+        /* Deliberately NOT gated on music. Moving is a robust signal on its own,
+         * whereas requiring audio made this dead silent whenever the room was —
+         * and keeping it audio-free means beat-detection quality (#264) cannot
+         * take the baseline behaviour down with it. */
+        const float bobGate = (current_ == kExprPleased) ? p.bobExit : p.bobEnter;
+        if (bob_ >= bobGate) {
+            return kExprPleased;
+        }
+        return kExprNeutral;
+    }
+
+    float accelYTilt() const { return gravityY_; }
+
+    void selectExpression(uint32_t dt_ms) {
+        const Profile &p = profile();
+
+        if (overrideLeftMs_ > 0) {
+            overrideLeftMs_ = (overrideLeftMs_ > dt_ms) ? (overrideLeftMs_ - dt_ms) : 0;
+            return;
+        }
+        if (!paramBool(kParamAuto)) {
+            return;
+        }
+
+        /* Momentary interrupt. Alert is an EVENT, not a state — treating it as
+         * something to arbitrate into means deciding when to leave it, which is
+         * unanswerable. A one-shot with a hold timer answers it for free. */
+        if (alertLeftMs_ > 0) {
+            alertLeftMs_ = (alertLeftMs_ > dt_ms) ? (alertLeftMs_ - dt_ms) : 0;
+            return;
+        }
+        if (startleRefractoryLeftMs_ > 0) {
+            startleRefractoryLeftMs_ =
+                (startleRefractoryLeftMs_ > dt_ms) ? (startleRefractoryLeftMs_ - dt_ms) : 0;
+        } else if (baseline_ <= p.quietCeiling && (engage_ - baseline_) >= p.startleExcess) {
+            /* Measured against the SLOW baseline, and only while that baseline is
+             * low. A per-tick delta fired on every beat of a click track (11-17
+             * expression changes in 10 s); sustained music simply raises the
+             * baseline, so the excess stays small and nothing startles. The
+             * refractory then stops one real event re-firing as several. */
+            startleRefractoryLeftMs_ = p.startleRefractoryMs;
+            alertLeftMs_ = p.alertHoldMs;
+            commit(kExprAlert);
+            return;
+        }
+
+        /* Background arbitration: a challenger must both differ AND persist,
+         * and the incumbent gets a minimum dwell. Without these two the state
+         * chatters every frame whenever a feature sits near its threshold —
+         * which is the failure mode that makes a face look broken. */
+        const size_t want = backgroundMood(p);
+        if (want == current_) {
+            candidateMs_ = 0;
+            return;
+        }
+        if (want != candidate_) {
+            candidate_ = want;
+            candidateMs_ = 0;
+        }
+        candidateMs_ += dt_ms;
+        if (candidateMs_ >= p.sustainMs && sinceChangeMs_ >= p.minDwellMs) {
+            commit(want);
+        }
+    }
+
+    void commit(size_t expression) {
+        if (expression == current_) {
+            return;
+        }
+        previous_ = current_;
+        current_ = expression;
+        startGlitch(glitchBaseMs());
+        pendingDoubleTake_ = rollPercent(paramU32(kParamDoubleTakePct));
+        sinceChangeMs_ = 0;
+        candidateMs_ = 0;
+        /* One line per CHANGE, never per tick. This is the chatter metric: the
+         * question that decides whether the tuning is right is "how many times
+         * did the face change in 30 s", and counting these answers it. */
+        printk("maskeyes expr=%u\n", (unsigned)expression);
     }
 
     void advanceGlitch(uint32_t dt_ms) {
@@ -316,6 +592,20 @@ class MaskEyes : public rgbx::Animation {
     uint32_t glitchLeftMs_ = 0;
     uint32_t glitchSpanMs_ = 0;
     bool pendingDoubleTake_ = false;
+
+    float gravityX_ = 0.0f, gravityY_ = 0.0f, gravityZ_ = 0.0f;
+    float bob_ = 0.0f;
+    float engage_ = 0.0f;
+    float baseline_ = 0.0f;
+    bool gravitySeeded_ = false;
+    uint32_t startleRefractoryLeftMs_ = 0;
+    bool beatWas_ = false;
+    bool beatEdge_ = false;
+    size_t candidate_ = 0;
+    uint32_t candidateMs_ = 0;
+    uint32_t sinceChangeMs_ = 0;
+    uint32_t alertLeftMs_ = 0;
+    uint32_t overrideLeftMs_ = 0;
     uint32_t rng_ = 0x9E3779B9u;
 };
 
@@ -326,4 +616,6 @@ RGBX_ANIMATION(MaskEyes, "Mask Eyes", 40, 12,
                RGBX_PARAM("Glitch Ms", RGBX_PARAM_UINT32, 160),
                RGBX_PARAM("Idle Glitch", RGBX_PARAM_BOOL, 1),
                RGBX_PARAM("Glitch Jitter", RGBX_PARAM_UINT32, 40),
-               RGBX_PARAM("Double Take", RGBX_PARAM_UINT32, 12));
+               RGBX_PARAM("Double Take", RGBX_PARAM_UINT32, 12),
+               RGBX_PARAM("Auto", RGBX_PARAM_BOOL, 1),
+               RGBX_PARAM("Lively", RGBX_PARAM_BOOL, 0));

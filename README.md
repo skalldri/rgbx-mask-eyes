@@ -10,17 +10,79 @@ and everything else is a departure that returns to it.
 
 ## Expressions
 
-Four, selected by button (proto0: 0=Up, 1=Left, 2=Right, 3=Down):
-
-| Button | Expression | Left / right eye |
+| Expression | Left / right eye | Driven by |
 | --- | --- | --- |
-| Up | neutral | `X` `X` |
-| Left | pleased | `^` `^` |
-| Right | alert | `!` `!` |
-| Down | angry | `>` `<` — pointing inward, which is what reads as a scowl |
+| neutral | `X` `X` | the floor — what it settles to |
+| pleased | `^` `^` | sustained head motion (bob or nod) |
+| alert | `!` `!` | a startle: sound rising sharply in a quiet room |
+| angry | `>` `<` | **manual only** |
+| tilt left | `—` `O` | head tilted, ear toward shoulder |
+| tilt right | `O` `—` | mirrored |
 
-Angry is the one asymmetric expression, which is deliberate: it proves the
-per-eye glyph model rather than assuming both eyes always match.
+The tilt pair and angry are asymmetric on purpose. Tilt has to be, since a
+symmetric glyph could not encode *which* way the head went; angry points the
+eyes inward at each other, which is what reads as a scowl.
+
+**Angry has no autonomous trigger, deliberately.** No head or audio gesture
+honestly means "angry", and inventing one would make the face lie. It stays a
+button/app expression.
+
+Buttons 0-3 (Up/Left/Right/Down) select the first four directly and suspend
+autonomous selection for 6 s, so the manual test path still works with `Auto` on.
+
+## Autonomous selection
+
+Raw inputs are continuous and noisy; expressions are discrete and few. Mapping
+one to the other with plain thresholds makes the state **chatter** — it flips
+every frame whenever a signal sits near a boundary, which on a face reads as
+broken rather than expressive. So the design is about arbitration:
+
+- **Features, not raw inputs.** Gravity is the low-passed accelerometer and
+  motion is what is left over, because the accelerometer reads +g on whichever
+  axis points up — without that split a lean and a nod are indistinguishable.
+  Motion includes the gyro, since a nod is a rotation. Engagement is smoothed
+  band energy, over a much slower "how loud has this room been lately" baseline.
+- **Momentary vs sustained.** Alert is an *event*, not a state: a one-shot with
+  a hold timer. Treating it as something to arbitrate into would mean deciding
+  when to leave it, which is unanswerable.
+- **Hysteresis and dwell.** A challenger must both differ *and* persist, the
+  incumbent gets a minimum dwell, and enter/exit thresholds differ. These are
+  what kill the chatter.
+
+Head tilt is roll about Z, which shows up on **accel.Y** (+X is the crown, +Y
+the left temple — `fw/docs/imu-coordinate-frame.md`). That doc has not
+bench-verified polarity, so if the tilt glyphs come out mirrored on a real head,
+flip `kTiltLeftSign` rather than editing the selector.
+
+Startles are measured against the *slow* baseline and only fire while that
+baseline is low. Sustained music simply raises it, so nothing startles at a gig —
+and a refractory period stops one real event re-firing as several.
+
+Nothing in the sustained path depends on beat detection, which keeps baseline
+behaviour insulated from beat-detection quality
+([#264](https://github.com/skalldri/rgb-sunglasses/issues/264)).
+
+### Measured, not guessed
+
+Thresholds were read off the simulator scenarios with a temporary trace:
+
+| scenario | bob | baseline |
+| --- | --- | --- |
+| silence | 0.00 | 0.00 |
+| dance | 1.80–2.52 | 0.03–0.92 |
+| nod | ~1.9 (gyro) | 0.00 |
+| pink noise | 0.00 | 1.23–10.79 |
+
+Expression changes per 10 s — chatter is the failure mode, so it is the metric:
+
+| scenario | calm | lively |
+| --- | --- | --- |
+| silence | 0 | 0 |
+| nod | 0 | 1 |
+| dance | 2 | 3 |
+| head-roll | 3 | 3 |
+| metronome-120 | 2 | 2 |
+| pink-noise | 2 | 2 |
 
 ## The glitch
 
@@ -66,9 +128,18 @@ usually a few seconds, occasionally much shorter or longer.
 | Idle Glitch | BOOL | on | The occasional tear while holding an expression |
 | Glitch Jitter | UINT32 | 40 | ±% spread on every glitch duration. 0 = fixed. Capped at 90 so a transition can never come out zero-length |
 | Double Take | UINT32 | 12 | % chance a transition stutters and re-lands. 0 = off |
+| Auto | BOOL | on | Autonomous selection. Off = buttons/app only |
+| Lively | BOOL | off | Reactivity profile — see below |
 
 Colour modes (spectrum sweep, random-on-beat, …) work on `Color` for free —
 the host resolves the mode byte before the extension sees it.
+
+**`Lively` is a switch rather than two builds** so the comparison can be made
+while wearing the glasses — instantly, even mid-song. Reflashing two variants and
+trying to remember how the first one felt is not a comparison anyone can make
+honestly. Calm holds a face long enough that moving means something; Lively
+reacts to everything and feels alive. It scales dwell, sustain, hysteresis
+margins and the startle threshold together.
 
 ## Design notes
 
@@ -87,6 +158,13 @@ pushing the glyphs down to use it would put their inner edges into the cutout.
 iterated by eye, and a packed bitmask is unreadable to edit. The cost is ~1 KB
 of rodata against a 24 KB llext heap.
 
+**`printk` is declared with `int` return, and that matters.** The SDK ships no
+declaration for it (see
+[#351](https://github.com/skalldri/rgb-sunglasses/issues/351)). Declaring it
+`void` still compiles, still links, and still passes the zero-imports gate — then
+traps `unreachable` on the first call, because WebAssembly calls are typed by
+signature.
+
 **Randomness is a self-contained xorshift32.** Not a preference — the SDK's
 supported symbol surface is 34 symbols (string/memory, `printk`, single-precision
 libm, 64-bit division helpers) and contains **no RNG at all**. An extension runs
@@ -98,10 +176,9 @@ which is what makes golden-frame comparison possible.
 
 ## Status
 
-First cut. Buttons drive the expression so the look can be judged; the intended
-end state is autonomous selection from IMU and audio (head bob → pleased, tilt →
-inquisitive, transient → alert) with the app able to override. That slots in
-above the expression table without changing the rendering or transition code.
+Autonomous selection works and is tuned against the simulator. **Not yet
+validated on a real head** — the reactivity profiles exist to be A/B'd on
+hardware, and tilt polarity needs confirming (see `kTiltLeftSign`).
 
 Tracked as [rgb-sunglasses#53](https://github.com/skalldri/rgb-sunglasses/issues/53).
 
