@@ -14,17 +14,7 @@
  */
 
 #include <rgbx/rgbx_animation.h>
-
-/* printk is on the SDK's supported symbol surface, but the SDK ships no
- * declaration for it and a standalone extension builds against no Zephyr
- * headers — so it has to be declared here.
- *
- * The return type is load-bearing: Zephyr's printk and the SDK's wasm shim both
- * return int. Declaring it void still LINKS (extern "C" mangles to the same
- * name) and still passes the zero-imports gate, then traps `unreachable` on the
- * first call, because WebAssembly calls are strictly typed by signature. Clean
- * build, clean gate, runtime trap. See rgb-sunglasses SDK issue. */
-extern "C" int printk(const char *fmt, ...);
+#include <rgbx/rgbx_sys.h>
 
 namespace {
 
