@@ -158,15 +158,19 @@ pushing the glyphs down to use it would put their inner edges into the cutout.
 iterated by eye, and a packed bitmask is unreadable to edit. The cost is ~1 KB
 of rodata against a 24 KB llext heap.
 
-**`printk` is declared with `int` return, and that matters.** The SDK ships no
-declaration for it (see
-[#351](https://github.com/skalldri/rgb-sunglasses/issues/351)). Declaring it
-`void` still compiles, still links, and still passes the zero-imports gate — then
-traps `unreachable` on the first call, because WebAssembly calls are typed by
-signature.
+**`printk` comes from `<rgbx/rgbx_sys.h>` — never hand-write its prototype.**
+`extern "C"` matches on the name alone, so a wrong signature links anyway and
+then diverges by target: on ARM a wrong return type is usually survivable, while
+in the simulator the same source traps `unreachable` on the first call, because
+WebAssembly calls are typed by full signature. This extension used to declare
+`extern "C" int printk(const char *, ...)` itself, which was correct only against
+the pre-`fw-v3.3.0` simulator shim. `rgbx_sys.h` (added in
+[#351](https://github.com/skalldri/rgb-sunglasses/issues/351)) now single-sources
+the whole supported symbol surface, and the wasm link runs with
+`--fatal-warnings`, so a mismatch is a build error rather than a runtime trap.
 
 **Randomness is a self-contained xorshift32.** Not a preference — the SDK's
-supported symbol surface is 34 symbols (string/memory, `printk`, single-precision
+supported symbol surface is 32 symbols (string/memory, `printk`, single-precision
 libm, 64-bit division helpers) and contains **no RNG at all**. An extension runs
 in a `K_USER` sandbox and can only resolve symbols the host exports, and the
 `.llext` build gates against that list, so calling into Zephyr for randomness
