@@ -192,6 +192,13 @@ Tracked as [rgb-sunglasses#53](https://github.com/skalldri/rgb-sunglasses/issues
 ./build.sh          # -> build/arm/mask_eyes.llext and build/wasm/mask_eyes.wasm
 ```
 
+Prerequisites: bash, cmake ≥ 3.21, Node.js ≥ 20, curl, tar. `build.sh` checks the
+Node version before it configures anything — the SDK's wasm gate
+(`check-wasm.mjs`) needs ≥ 20, and an older one fails the wasm link with a bare
+`SyntaxError` from inside the SDK. If you upgrade Node after a build, re-run
+`./build.sh -URGBX_NODE`: CMake cached the old interpreter's path at configure
+time and keeps using it otherwise.
+
 Drag the `.wasm` onto the [hosted simulator](https://rgb-sunglasses.autom8ed.com/sim/),
 or run it headlessly from a firmware checkout — `buttons-tour` presses all five
 buttons 600 ms apart, which walks the whole expression set:
