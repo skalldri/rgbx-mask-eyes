@@ -185,6 +185,15 @@ constexpr size_t kParamJitterPct = 3;
 constexpr size_t kParamDoubleTakePct = 4;
 constexpr size_t kParamAuto = 5;
 constexpr size_t kParamLively = 6;
+/* Numeric overrides on top of the profiles: 0 means "use the profile's value",
+ * which is unambiguous because 0 is never a legal live value for any of them.
+ * The x10/x1000 scaling exists because the param ABI has no float type;
+ * "Bob Enter x10"=85 therefore means 8.5 m/s^2-equivalent units. */
+constexpr size_t kParamBobEnterX10 = 7;
+constexpr size_t kParamTiltEnterX10 = 8;
+constexpr size_t kParamTiltSpeed = 9; /* fast-tilt filter alpha x1000 */
+constexpr size_t kParamSustainMs = 10;
+constexpr size_t kParamDwellMs = 11;
 
 /* Two coherent constant sets rather than two builds, so the comparison is a
  * switch you flip on the phone WHILE WEARING the glasses — instantly, even
@@ -207,30 +216,50 @@ struct Profile {
  * everything and feels alive. Neither is obviously right — that is the whole
  * reason this is a runtime switch. */
 /* Thresholds are MEASURED, not guessed — read off the sim scenarios with a
- * temporary trace, after the gravity-seeding fix stopped inflating them:
+ * temporary trace. The bob and tilt numbers were re-based on REAL captures
+ * (walk-no-music-1, head-roll-no-music) after the synthetic scenarios turned
+ * out to be unrealistically gentle: real walking runs bob ~4.0 mean / 6.75
+ * max, which sat entirely above the old enter of 1.6, so the face lived in
+ * "pleased" the moment its wearer moved.
  *
- *   silence      bob 0.00        baseline 0.00
- *   dance        bob 1.80-2.52   baseline 0.03-0.92
- *   nod          bob 1.9 (gyro-driven, ~0 before the gyro term)
- *   metronome    bob 0.00        baseline 0.03-0.92
- *   pink noise   bob 0.00        baseline 1.23-10.79
+ *   silence         bob 0.00              baseline 0.00
+ *   walking (real)  bob 4.0 avg, 6.75 max
+ *   head rolls      bob 8-16
+ *   dance/nod (synthetic, gentle) bob <= 3.7 — no longer reach pleased,
+ *                   accepted: they under-shoot real motion by ~2x
+ *   metronome       bob 0.00              baseline 0.03-0.92
+ *   pink noise      bob 0.00              baseline 1.23-10.79
  *
- * bobEnter therefore has to sit below 1.8 to catch bobbing at all — the first
- * pass used 2.4, which the `dance` scenario only grazed at its peak, so calm
- * never reached "pleased". quietCeiling has to sit below ~0.9 or a click track
+ * bobEnter sits above walking's max so plain walking never triggers, with
+ * bobExit above walking's p90 (5.4) so it always releases; pleased is for
+ * vigorous, deliberate motion (dancing, head-banging). Tilt reads the FAST
+ * tilt filter (see kTiltFastAlpha): walking's worst fast-tilt excursion is
+ * 3.6, forward head rolls leak 2.8, real side rolls peak 5-8.9, so enter 4.0
+ * separates them all. quietCeiling has to sit below ~0.9 or a click track
  * never raises the baseline out of startle range. */
-constexpr Profile kCalm = {900u, 450u, 900u, 3.2f, 2.0f, 1.6f, 1.0f, 0.8f, 0.5f, 5000u};
-constexpr Profile kLively = {350u, 140u, 550u, 2.0f, 1.2f, 1.1f, 0.7f, 0.5f, 0.5f, 3000u};
+constexpr Profile kCalm = {900u, 450u, 900u, 4.0f, 2.0f, 8.5f, 6.0f, 0.8f, 0.5f, 5000u};
+constexpr Profile kLively = {350u, 140u, 550u, 4.0f, 2.5f, 7.0f, 5.0f, 0.5f, 0.5f, 3000u};
 
 /* A manual press pins its expression and suspends autonomous selection, so the
  * button test path still works with Auto on. */
 constexpr uint32_t kOverrideMs = 6000;
 
-/* Exponential smoothing coefficients, per tick at the nominal ~90 Hz.
+/* Exponential smoothing coefficients, per tick at the nominal ~30 Hz (the
+ * host ticks every 33 ms; an earlier version of this comment claimed ~90 Hz,
+ * which was never true).
  * Gravity is deliberately far slower than motion: the split between them is
  * what separates "which way is your head pointing" from "are you moving", and
  * a gravity estimate that tracks motion collapses the two. */
 constexpr float kGravityAlpha = 0.02f;
+/* Tilt gets its OWN, much faster low-pass. The gravity estimate above is the
+ * right reference for the bob residual, but at tau ~1.7 s it is far too slow
+ * to answer "is the head tilted right now": measured on head-roll-no-music,
+ * raw |accel.Y| crossed 3.2 m/s^2 at t=1.1 s while the gravity estimate took
+ * until t=13.4 s — a brief roll never registered at all. 0.12/tick (tau
+ * ~260 ms) tracks a roll in a few hundred ms while still ironing out the
+ * per-step spikes of a walk (0.15 pushed walking's excursions to 3.8, too
+ * close to the 4.0 enter threshold). */
+constexpr float kTiltFastAlpha = 0.12f;
 constexpr float kBobAlpha = 0.10f;
 constexpr float kEngageAlpha = 0.06f;
 /* The startle baseline is far slower still — it is "how loud has this room been
@@ -251,9 +280,9 @@ constexpr uint32_t kMaxJitterPct = 90;
 constexpr uint32_t kDoubleTakeNumerator = 1;
 constexpr uint32_t kDoubleTakeDenominator = 2;
 
-/* Idle glitch: roughly one micro-tear every few seconds so a held expression
- * never reads as a frozen image. Expressed as a 1-in-N chance per tick at the
- * nominal ~90 Hz tick rate. */
+/* Idle glitch: roughly one micro-tear every several seconds so a held
+ * expression never reads as a frozen image. Expressed as a 1-in-N chance per
+ * tick at the nominal ~30 Hz tick rate (so ~8.7 s between tears on average). */
 constexpr uint32_t kIdleGlitchOdds = 260;
 constexpr uint32_t kIdleGlitchMs = 45;
 
@@ -317,6 +346,45 @@ class MaskEyes : public rgbx::Animation {
 
     const Profile &profile() const { return paramBool(kParamLively) ? kLively : kCalm; }
 
+    /* Override accessors: a nonzero override param wins, 0 falls back to the
+     * active profile. The paired exit thresholds derive from the profile's
+     * exit:enter ratio, so one knob per axis moves the whole hysteresis band
+     * without collapsing it. */
+    float bobEnterEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamBobEnterX10);
+        return (o != 0u) ? static_cast<float>(o) * 0.1f : p.bobEnter;
+    }
+    float bobExitEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamBobEnterX10);
+        return (o != 0u) ? bobEnterEff(p) * (p.bobExit / p.bobEnter) : p.bobExit;
+    }
+    float tiltEnterEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamTiltEnterX10);
+        return (o != 0u) ? static_cast<float>(o) * 0.1f : p.tiltEnter;
+    }
+    float tiltExitEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamTiltEnterX10);
+        return (o != 0u) ? tiltEnterEff(p) * (p.tiltExit / p.tiltEnter) : p.tiltExit;
+    }
+    float tiltAlphaEff() const {
+        uint32_t o = paramU32(kParamTiltSpeed);
+        if (o == 0u) {
+            return kTiltFastAlpha;
+        }
+        if (o > 500u) {
+            o = 500u; /* alpha 0.5 already tracks within ~2 ticks; beyond it is raw accel */
+        }
+        return static_cast<float>(o) * 0.001f;
+    }
+    uint32_t sustainMsEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamSustainMs);
+        return (o != 0u) ? o : p.sustainMs;
+    }
+    uint32_t dwellMsEff(const Profile &p) const {
+        const uint32_t o = paramU32(kParamDwellMs);
+        return (o != 0u) ? o : p.minDwellMs;
+    }
+
     static float absf(float v) { return v < 0.0f ? -v : v; }
 
     /* Turns raw inputs into a few stable scalars, each with its own time
@@ -336,10 +404,12 @@ class MaskEyes : public rgbx::Animation {
             gravityX_ = accelX();
             gravityY_ = accelY();
             gravityZ_ = accelZ();
+            tiltFastY_ = accelY();
         }
         gravityX_ += (accelX() - gravityX_) * kGravityAlpha;
         gravityY_ += (accelY() - gravityY_) * kGravityAlpha;
         gravityZ_ += (accelZ() - gravityZ_) * kGravityAlpha;
+        tiltFastY_ += (accelY() - tiltFastY_) * tiltAlphaEff();
 
         /* Gyro is included because a nod is a ROTATION: the `nod` scenario drives
          * gyro alone and measured bob = 0 with an accel-only feature, i.e. the
@@ -377,8 +447,9 @@ class MaskEyes : public rgbx::Animation {
      * It stays a manual expression. */
     size_t backgroundMood(const Profile &p) const {
         const float tilt = accelYTilt();
-        const float enter = (current_ == kExprTiltLeft || current_ == kExprTiltRight) ? p.tiltExit
-                                                                                     : p.tiltEnter;
+        const float enter = (current_ == kExprTiltLeft || current_ == kExprTiltRight)
+                                ? tiltExitEff(p)
+                                : tiltEnterEff(p);
         if (absf(tilt) >= enter) {
             return (tilt * kTiltLeftSign > 0.0f) ? kExprTiltLeft : kExprTiltRight;
         }
@@ -387,14 +458,14 @@ class MaskEyes : public rgbx::Animation {
          * whereas requiring audio made this dead silent whenever the room was —
          * and keeping it audio-free means beat-detection quality (#264) cannot
          * take the baseline behaviour down with it. */
-        const float bobGate = (current_ == kExprPleased) ? p.bobExit : p.bobEnter;
+        const float bobGate = (current_ == kExprPleased) ? bobExitEff(p) : bobEnterEff(p);
         if (bob_ >= bobGate) {
             return kExprPleased;
         }
         return kExprNeutral;
     }
 
-    float accelYTilt() const { return gravityY_; }
+    float accelYTilt() const { return tiltFastY_; }
 
     void selectExpression(uint32_t dt_ms) {
         const Profile &p = profile();
@@ -443,7 +514,7 @@ class MaskEyes : public rgbx::Animation {
             candidateMs_ = 0;
         }
         candidateMs_ += dt_ms;
-        if (candidateMs_ >= p.sustainMs && sinceChangeMs_ >= p.minDwellMs) {
+        if (candidateMs_ >= sustainMsEff(p) && sinceChangeMs_ >= dwellMsEff(p)) {
             commit(want);
         }
     }
@@ -584,6 +655,7 @@ class MaskEyes : public rgbx::Animation {
     bool pendingDoubleTake_ = false;
 
     float gravityX_ = 0.0f, gravityY_ = 0.0f, gravityZ_ = 0.0f;
+    float tiltFastY_ = 0.0f;
     float bob_ = 0.0f;
     float engage_ = 0.0f;
     float baseline_ = 0.0f;
@@ -608,4 +680,9 @@ RGBX_ANIMATION(MaskEyes, "Mask Eyes", 40, 12,
                RGBX_PARAM("Glitch Jitter", RGBX_PARAM_UINT32, 40),
                RGBX_PARAM("Double Take", RGBX_PARAM_UINT32, 12),
                RGBX_PARAM("Auto", RGBX_PARAM_BOOL, 1),
-               RGBX_PARAM("Lively", RGBX_PARAM_BOOL, 0));
+               RGBX_PARAM("Lively", RGBX_PARAM_BOOL, 0),
+               RGBX_PARAM("Bob Enter x10", RGBX_PARAM_UINT32, 0),
+               RGBX_PARAM("Tilt Enter x10", RGBX_PARAM_UINT32, 0),
+               RGBX_PARAM("Tilt Speed", RGBX_PARAM_UINT32, 0),
+               RGBX_PARAM("Sustain Ms", RGBX_PARAM_UINT32, 0),
+               RGBX_PARAM("Dwell Ms", RGBX_PARAM_UINT32, 0));
